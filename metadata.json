@@ -1,0 +1,8 @@
+
+{
+  "name": "车道优",
+  "description": "基于 Leaflet 和 OpenStreetMap 的开源 WebGIS 系统，集成了deepseek进行车道级别的数据分析与路面状况评估。",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
