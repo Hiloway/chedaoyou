@@ -1,7 +1,7 @@
 
 # 车道优系统
 
-基于 WebGIS 的车道健康度监测与养护管理平台。前端 React + Leaflet + 天地图，后端 Express + MySQL，集成 DeepSeek 文本分析与通义千问视觉病害诊断。
+基于 WebGIS 的车道健康度监测与养护管理平台。
 
 ## 功能概览
 
@@ -12,14 +12,6 @@
 - **空间分析**：Getis-Ord Gi* 热点分析 + 核密度估计，区域健康度评分
 - **多角色**：管理员 / 维修方 / 普通用户，JWT 鉴权
 
-## 技术栈
-
-| 层 | 技术 |
-|---|---|
-| 前端 | React 19 + TypeScript + Vite 6 + Leaflet + TailwindCSS |
-| 后端 | Express 5 + MySQL2 + JWT + bcryptjs |
-| AI | DeepSeek（文本）+ 通义千问 VL（视觉），经后端代理调用 |
-| 地图 | 天地图底图 + OSM Overpass + 百度街景 |
 
 ## 目录结构
 
