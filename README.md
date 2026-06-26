@@ -88,7 +88,6 @@ cp .env.example .env.local
 | `VITE_BAIDU_AK` | 百度地图/街景 AK（前端可见） |
 | `VITE_COORDINATE_MODE` | 坐标系：`wgs84`（默认）或 `gcj02` |
 
-> AI Key 现在通过后端代理调用，不再暴露到前端。
 
 ### 3. 初始化数据库
 
@@ -99,10 +98,10 @@ mysql -u root -p < server/init.sql
 ### 4. 启动服务
 
 ```bash
-# 后端（端口 4000）
+# 后端
 npm run start:server
 
-# 前端（端口 3000，另开终端）
+# 前端
 npm run dev
 ```
 
