@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { repairApi } from '../services/api';
 
 interface Report {
   id: number;
@@ -15,9 +16,10 @@ interface Report {
 interface Props {
   roadId: string;
   onClose: () => void;
+  initialReportId?: number;
 }
 
-const ReportList: React.FC<Props> = ({ roadId, onClose }) => {
+const ReportList: React.FC<Props> = ({ roadId, onClose, initialReportId }) => {
   const [reports, setReports] = useState<Report[]>([]);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<Report | null>(null);
@@ -27,15 +29,16 @@ const ReportList: React.FC<Props> = ({ roadId, onClose }) => {
     const fetchReports = async () => {
       setLoading(true);
       try {
-        const res = await fetch(`/api/repair-reports?road_id=${encodeURIComponent(roadId)}`);
-        if (res.ok) {
-          const data = await res.json();
-          // 统一解析 attachment_urls 字段（可能为 JSON 字符串）
-          const normalized = (data || []).map((r: any) => ({
-            ...r,
-            attachment_urls: Array.isArray(r.attachment_urls) ? r.attachment_urls : (r.attachment_urls ? JSON.parse(r.attachment_urls) : []),
-          }));
-          setReports(normalized);
+        const data = await repairApi.list(roadId);
+        // 统一解析 attachment_urls 字段（可能为 JSON 字符串）
+        const normalized = (data || []).map((r: any) => ({
+          ...r,
+          attachment_urls: Array.isArray(r.attachment_urls) ? r.attachment_urls : (r.attachment_urls ? JSON.parse(r.attachment_urls) : []),
+        }));
+        setReports(normalized);
+        if (initialReportId) {
+          const matched = normalized.find((r: Report) => Number(r.id) === Number(initialReportId));
+          if (matched) setSelected(matched);
         }
       } catch (e) {
         console.error('fetch reports error', e);
@@ -44,7 +47,13 @@ const ReportList: React.FC<Props> = ({ roadId, onClose }) => {
       }
     };
     fetchReports();
-  }, [roadId]);
+  }, [roadId, initialReportId]);
+
+  useEffect(() => {
+    if (!initialReportId || reports.length === 0) return;
+    const matched = reports.find(r => Number(r.id) === Number(initialReportId));
+    if (matched) setSelected(matched);
+  }, [initialReportId, reports]);
 
   return (
     <div className="fixed inset-0 bg-black/30 z-[4000] flex items-center justify-center" onClick={onClose}>

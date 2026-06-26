@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { X, User, Lock, Key, PlusCircle, ArrowLeft } from 'lucide-react';
+import { authApi, setToken } from '../services/api';
 
 const roles = [
   { value: 'admin', label: '数据管理员' },
@@ -45,28 +46,15 @@ const Login: React.FC<{ onLogin: (role: string, username: string) => void }> = (
     if (!username || !password) { setError('用户名和密码为必填'); return; }
     setLoading(true);
     try {
-      const resp = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
-      let data: any = null;
-      const contentType = resp.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
-        try { data = await resp.json(); } catch (e) { data = null; }
-      } else {
-        const text = await resp.text();
-        console.error('Non-JSON response for /api/login:', resp.status, text);
-      }
-      if (!resp.ok) {
-        setError(data?.message || `登录失败: ${resp.status} ${resp.statusText}`);
-      } else {
-        const acc = data?.account;
-        setMessage('登录成功');
-        // 持久化简单登录状态（用于刷新后仍保持登录）
-        try { localStorage.setItem('lane_user', JSON.stringify({ role: acc?.role || 'user', username: acc?.username || username })); } catch (e) { /* ignore */ }
-        if (data && data.token) { try { localStorage.setItem('lane_token', data.token); } catch (e) { /* ignore */ } }
-        onLogin(acc?.role || 'user', acc?.username || username);
-      }
-    } catch (err) {
+      const data = await authApi.login(username, password);
+      const acc = data?.account;
+      setMessage('登录成功');
+      try { localStorage.setItem('lane_user', JSON.stringify({ role: acc?.role || 'user', username: acc?.username || username })); } catch (e) { /* ignore */ }
+      if (data && data.token) setToken(data.token);
+      onLogin(acc?.role || 'user', acc?.username || username);
+    } catch (err: any) {
       console.error('login error', err);
-      setError('网络错误：无法连接到后端');
+      setError(err?.message || '网络错误：无法连接到后端');
     } finally { setLoading(false); }
   };
 
@@ -76,12 +64,10 @@ const Login: React.FC<{ onLogin: (role: string, username: string) => void }> = (
     if (password !== confirm) { setError('两次密码不一致'); setLoading(false); return; }
     try {
       const body: any = { username, password, role };
-      if (role !== 'admin') body.profile = profile; else body.profile = profile;
-      const resp = await fetch('/api/register', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-      const data = await resp.json();
-      if (!resp.ok) { setError(data?.message || '注册失败'); }
-      else { setMessage('注册成功，已自动登录'); await doLogin(); }
-    } catch (err) { console.error('register error', err); setError('网络错误'); }
+      body.profile = profile;
+      await authApi.register(body);
+      setMessage('注册成功，已自动登录'); await doLogin();
+    } catch (err: any) { console.error('register error', err); setError(err?.message || '网络错误'); }
     finally { setLoading(false); }
   };
 
@@ -89,11 +75,9 @@ const Login: React.FC<{ onLogin: (role: string, username: string) => void }> = (
     setError(null); setMessage(null); setLoading(true);
     if (!username) { setError('请输入用户名'); setLoading(false); return; }
     try {
-      const resp = await fetch('/api/password-reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username }) });
-      const data = await resp.json();
-      if (!resp.ok) { setError(data?.message || '请求失败'); }
-      else { setResetToken(data.token); setMessage('已生成重置 token（开发环境展示）'); }
-    } catch (err) { console.error('password-reset error', err); setError('网络错误'); }
+      const data = await authApi.requestPasswordReset(username);
+      setResetToken(data.token); setMessage('已生成重置 token（开发环境展示）');
+    } catch (err: any) { console.error('password-reset error', err); setError(err?.message || '网络错误'); }
     finally { setLoading(false); }
   };
 
@@ -101,19 +85,16 @@ const Login: React.FC<{ onLogin: (role: string, username: string) => void }> = (
     setError(null); setMessage(null); setLoading(true);
     if (!username || !newPassword) { setError('请填写用户名与新密码'); setLoading(false); return; }
     try {
-      let resp;
       if (resetInputToken) {
-        resp = await fetch('/api/password-reset/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, token: resetInputToken, new_password: newPassword }) });
+        await authApi.confirmPasswordReset({ username, token: resetInputToken, new_password: newPassword });
       } else {
         if (!oldPassword || !phone) { setError('请填写旧密码与电话号码或提供 token'); setLoading(false); return; }
-        resp = await fetch('/api/password-reset/simple', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, old_password: oldPassword, phone, new_password: newPassword }) });
+        await authApi.simplePasswordReset({ username, old_password: oldPassword, phone, new_password: newPassword });
       }
-      const data = await resp.json();
-      if (!resp.ok) { setError(data?.message || '重置失败'); }
-      else { setMessage('密码重置成功，请使用新密码登录'); setTab('login'); setResetToken(null); setResetInputToken(''); setNewPassword(''); setOldPassword(''); setPhone(''); }
-    } catch (err) { console.error('password-reset-confirm error', err); setError('网络错误'); }
+      setMessage('密码重置成功，请使用新密码登录'); setTab('login'); setResetToken(null); setResetInputToken(''); setNewPassword(''); setOldPassword(''); setPhone('');
+    } catch (err: any) { console.error('password-reset-confirm error', err); setError(err?.message || '网络错误'); }
     finally { setLoading(false); }
-  }; 
+  };
 
   return (
     <div className="fixed inset-0 flex items-center justify-center z-[5000] bg-black/40 p-4">

@@ -4,11 +4,15 @@ import L from 'leaflet';
 import Sidebar from './components/Sidebar';
 import LaneDetails from './components/LaneDetails';
 import RegionSelector from './components/RegionSelector';
+import StreetViewModal from './components/StreetViewModal';
+import PhotoAnalysisModal from './components/PhotoAnalysisModal';
 import { LaneInfo, Region } from './types';
 import { fetchRealLanes, fetchRealLanesByBbox } from './services/laneService';
+import { roadApi, messageApi } from './services/api';
 import { MAP_DEFAULT_PROPS } from './constants';
-import { analyzeDamagePhoto } from './services/deepseekService';
-import { Layers, Map as MapIcon, Loader2, Navigation, RefreshCw, AlertTriangle, Minimize2, Maximize2, MapPin, X } from 'lucide-react';
+import { computeGetisOrdGi, interpretHotspots, computeKernelDensity, aggregateHotspotsByRoad } from './services/spatialAnalysis';
+import { matchLaneId, formatDateShort, getLaneFirstPoint, getLaneLengthMeters, getConditionColor } from './utils/lane';
+import { Loader2, Navigation, RefreshCw, AlertTriangle, Minimize2, Maximize2 } from 'lucide-react';
 
 const App: React.FC = () => {
   const baiduAk = import.meta.env.VITE_BAIDU_AK || '';
@@ -57,14 +61,15 @@ const App: React.FC = () => {
   // 百度街景位置状态
   const [streetViewLocation, setStreetViewLocation] = useState<{lat: number, lng: number} | null>(null);
   
-  // 图片预览状态
+  // 图片预览状态（分析逻辑已下沉到 PhotoAnalysisModal 组件内部）
   const [viewPhotoUrl, setViewPhotoUrl] = useState<string | null>(null);
-  const [photoAnalysis, setPhotoAnalysis] = useState<any | null>(null);
-  const [photoAnalysisLoading, setPhotoAnalysisLoading] = useState(false);
-  const [photoAnalysisError, setPhotoAnalysisError] = useState<string | null>(null);
   
   // 从消息盒子跳转时自动填充的上报人信息
   const [pendingEditInfo, setPendingEditInfo] = useState<any | null>(null);
+  // 从消息盒子跳转时自动打开维修报告
+  const [pendingRepairInfo, setPendingRepairInfo] = useState<any | null>(null);
+  // 从消息盒子跳转时自动打开维修记录
+  const [pendingReportReviewInfo, setPendingReportReviewInfo] = useState<any | null>(null);
 
   // 监听百度街景事件和图片预览事件
   useEffect(() => {
@@ -76,9 +81,6 @@ const App: React.FC = () => {
     const handleViewPhoto = (e: any) => {
       if (e.detail && e.detail.url) {
         setViewPhotoUrl(e.detail.url);
-        setPhotoAnalysis(null);
-        setPhotoAnalysisError(null);
-        setPhotoAnalysisLoading(false);
       }
     };
     window.addEventListener('open-street-view', handleOpenStreetView);
@@ -100,13 +102,7 @@ const App: React.FC = () => {
       try {
         const ok = window.confirm('确认删除该上报点？此操作不可恢复');
         if (!ok) return;
-        const resp = await fetch(`/api/message/${id}`, { method: 'DELETE' });
-        if (!resp.ok) {
-          const txt = await resp.text();
-          console.error('删除上报点失败', txt);
-          alert('删除失败，请稍后重试');
-          return;
-        }
+        await messageApi.remove(id);
         // 从本地状态移除对应点
         setLanes(prev => prev.map(l => {
           if (roadId && l.id !== roadId) return l;
@@ -152,46 +148,36 @@ const App: React.FC = () => {
   const polylineMapRef = useRef<Map<string, L.Polyline>>(new Map());
   const damageMarkersRef = useRef<L.CircleMarker[]>([]);
 
-  // 获取状态对应的颜色
-  const getConditionColor = (condition: string, isSelected: boolean) => {
-    if (isSelected) return '#4f46e5'; // 选中时统一显示为深蓝色高亮
-    switch (condition) {
-      case 'Excellent': return '#10b981'; // 绿色
-      case 'Good': return '#22c55e'; // 浅绿色
-      case 'Fair': return '#f59e0b'; // 黄色
-      case 'Poor': return '#ef4444'; // 红色
-      default: return '#64748b';
-    }
+  const flyToLane = (laneLike: any, zoom: number = 16) => {
+    if (!map) return;
+    const first = getLaneFirstPoint(laneLike);
+    if (!first) return;
+    map.flyTo([first.lat, first.lng], zoom);
   };
-
-  // 把任意时间字符串或 Date 标准化为 YYYY-MM-DD（若无法解析则返回原始值或空串）
-  const formatDateShort = (v?: string | Date | null) => {
-    if (!v) return '';
-    try {
-      if (typeof v === 'string') {
-        // 若像 '2026-01-10T12:34:56.000Z'，取前 10 位
-        const iso = v.trim();
-        if (iso.length >= 10 && iso[4] === '-') return iso.slice(0, 10);
-        const d = new Date(iso);
-        if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
-        return iso;
-      }
-      if (v instanceof Date && !isNaN(v.getTime())) return v.toISOString().slice(0, 10);
-      return '';
-    } catch (err) { return '';} 
-  }; 
 
   useEffect(() => {
     if (!mapRef.current || map) return;
     const leafletMap = L.map(mapRef.current, {
       center: [MAP_DEFAULT_PROPS.center.lat, MAP_DEFAULT_PROPS.center.lng],
       zoom: 15,
-      zoomControl: false 
+      maxZoom: 18,
+      zoomControl: false,
+      zoomAnimation: false,
+      markerZoomAnimation: false,
+      zoomSnap: 0.05,
+      zoomDelta: 0.05,
+      wheelPxPerZoomLevel: 140,
+      wheelDebounceTime: 40,
+      scrollWheelZoom: true,
     });
     L.tileLayer(
       'http://t0.tianditu.gov.cn/DataServer?T=vec_w&x={x}&y={y}&l={z}&tk=8c0f066c87196e801b0db5c201ff798c',
       {
         maxZoom: 18,
+        maxNativeZoom: 18,
+        updateWhenZooming: false,
+        updateWhenIdle: true,
+        keepBuffer: 3,
         attribution: '© 天地图'
       }
     ).addTo(leafletMap);
@@ -199,6 +185,79 @@ const App: React.FC = () => {
     setMap(leafletMap);
     return () => { leafletMap.remove(); };
   }, []);
+
+  // 缩放/窗口变化后强制重算地图尺寸与矢量图层，避免出现道路与底图错位
+  useEffect(() => {
+    if (!map) return;
+
+    let rafId: number | null = null;
+    let needInvalidate = false;
+    let settleTimer: number | null = null;
+
+    const syncLayers = () => {
+      try {
+        polyLinesRef.current.forEach((line: any) => {
+          if (line && typeof line.redraw === 'function') line.redraw();
+        });
+        damageMarkersRef.current.forEach((marker: any) => {
+          if (marker && typeof marker.redraw === 'function') marker.redraw();
+        });
+      } catch (err) {}
+    };
+
+    const flush = () => {
+      rafId = null;
+      if (needInvalidate) {
+        try { map.invalidateSize({ pan: false }); } catch (err) {}
+        needInvalidate = false;
+      }
+      syncLayers();
+    };
+
+    const schedule = (withInvalidate: boolean = false) => {
+      needInvalidate = needInvalidate || withInvalidate;
+      if (rafId !== null) return;
+      rafId = window.requestAnimationFrame(flush);
+    };
+
+    const onWindowResize = () => schedule(true);
+    const onZoomEnd = () => {
+      schedule(true);
+      if (settleTimer !== null) {
+        try { window.clearTimeout(settleTimer); } catch (err) {}
+      }
+      settleTimer = window.setTimeout(() => {
+        schedule(true);
+        try { map.panBy([0, 0], { animate: false }); } catch (err) {}
+      }, 60);
+    };
+    const onMoveEnd = () => schedule(true);
+
+    window.addEventListener('resize', onWindowResize);
+    map.on('zoomend', onZoomEnd);
+    map.on('moveend', onMoveEnd);
+
+    return () => {
+      window.removeEventListener('resize', onWindowResize);
+      map.off('zoomend', onZoomEnd);
+      map.off('moveend', onMoveEnd);
+      if (settleTimer !== null) {
+        try { window.clearTimeout(settleTimer); } catch (err) {}
+      }
+      if (rafId !== null) {
+        try { window.cancelAnimationFrame(rafId); } catch (err) {}
+      }
+    };
+  }, [map]);
+
+  // 当界面布局变化（如详情面板开关）时补一次尺寸校正
+  useEffect(() => {
+    if (!map) return;
+    const timer = window.setTimeout(() => {
+      try { map.invalidateSize({ pan: false }); } catch (err) {}
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [map, showDetails, selectedAreaMinimized, selectedAreaAnalysis]);
 
   // 当框选模式被打开时，使用「鼠标按下→拖动→抬起」的方式绘制矩形并处理事件（更直观的拖拽框选）
   const boxSelectStartRef = useRef<L.LatLng | null>(null);
@@ -420,33 +479,15 @@ const App: React.FC = () => {
       try {
         const idsArray = realData.map(r => r.id).filter(Boolean);
         if (idsArray.length > 0) {
-          const [res, msgRes] = await Promise.all([
-            fetch(`/api/road-conditions/batch`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ ids: idsArray })
-            }),
-            fetch(`/api/messages/batch`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ ids: idsArray })
-            })
+          const [dbSettled, msgSettled] = await Promise.allSettled([
+            roadApi.batchGet(idsArray),
+            messageApi.batchGet(idsArray),
           ]);
-          
-          let dbRows = [];
-          if (res.ok) {
-            dbRows = await res.json();
-          } else {
-            console.error('Failed to fetch road conditions batch:', await res.text());
-          }
-          
-          let msgRows = [];
-          if (msgRes.ok) {
-            msgRows = await msgRes.json();
-            console.log('Fetched messages batch:', msgRows.length, 'records for', idsArray.length, 'lanes');
-          } else {
-            console.error('Failed to fetch messages batch:', await msgRes.text());
-          }
+          const dbRows = dbSettled.status === 'fulfilled' ? (dbSettled.value || []) : [];
+          const msgRows = msgSettled.status === 'fulfilled' ? (msgSettled.value || []) : [];
+          if (dbSettled.status === 'rejected') console.error('Failed to fetch road conditions batch:', dbSettled.reason);
+          if (msgSettled.status === 'rejected') console.error('Failed to fetch messages batch:', msgSettled.reason);
+          console.log('Fetched messages batch:', msgRows.length, 'records for', idsArray.length, 'lanes');
 
           const dbMap: Record<string, any> = {};
           dbRows.forEach((r: any) => { dbMap[String(r.road_id)] = r; });
@@ -466,19 +507,12 @@ const App: React.FC = () => {
             });
           });
 
-          const matchId = (lId: string, rId: string) => {
-            if (!lId || !rId) return false;
-            if (lId === rId) return true;
-            if (lId.endsWith(rId)) return true;
-            if (rId.endsWith(lId)) return true;
-            return false;
-          };
           const merged = realData.map(r => {
             // 仅使用精确匹配（避免模糊匹配污染多条路段）；如需模糊匹配则需要更严格的规则与人工确认
             let rec = dbMap[String(r.id)];
             if (!rec) {
               // 记录可能的模糊候选以便排查，但不自动应用（如果确实需要，可以启用更严格的单一候选规则）
-              const candidates = dbRows.filter((d: any) => matchId(r.id, d.road_id));
+              const candidates = dbRows.filter((d: any) => matchLaneId(r.id, d.road_id));
               if (candidates.length === 1 && candidates[0].road_id && String(candidates[0].road_id).length > 6) {
                 // 如果只有一个且 id 不是非常短（避免 '1' 之类的模糊匹配），可以作为候选
                 rec = candidates[0];
@@ -526,25 +560,24 @@ const App: React.FC = () => {
     const handler = async (e: any) => {
       const roadId = e?.detail?.roadId;
       if (!roadId) return;
-      const matchId = (lId: string, rId: string) => {
-        if (!lId || !rId) return false;
-        if (lId === rId) return true;
-        if (lId.endsWith(rId)) return true;
-        if (rId.endsWith(lId)) return true;
-        return false;
-      };
-      let found = lanes.find(l => matchId(l.id, roadId));
+      let found = lanes.find(l => matchLaneId(l.id, roadId));
       if (!found) {
         // 尝试刷新附近路段再找一遍
         const loaded = await loadNearbyLanes();
-        found = (loaded || []).find((l: any) => matchId(l.id, roadId));
+        found = (loaded || []).find((l: any) => matchLaneId(l.id, roadId));
       }
       if (found) {
+        setPendingEditInfo(null);
+        setPendingRepairInfo(null);
+        setPendingReportReviewInfo(null);
         setSelectedLane(found);
         setShowDetails(true);
-        if (map) map.flyTo([found.coordinates[0].lat, found.coordinates[0].lng], 16);
+        flyToLane(found, 16);
       } else {
         // 如果仍未找到，可尝试直接设置 selectedLane 的 id 并打开详情（部分信息可能缺失）
+        setPendingEditInfo(null);
+        setPendingRepairInfo(null);
+        setPendingReportReviewInfo(null);
         setSelectedLane({ id: roadId, roadName: roadId, coordinates: [{ lat: map?.getCenter().lat || 0, lng: map?.getCenter().lng || 0 }], laneCount: 0 } as any);
         setShowDetails(true);
       }
@@ -559,33 +592,133 @@ const App: React.FC = () => {
       const roadId = e?.detail?.roadId;
       const reporterInfo = e?.detail?.reporterInfo;
       if (!roadId) return;
-      const matchId = (lId: string, rId: string) => {
-        if (!lId || !rId) return false;
-        if (lId === rId) return true;
-        if (lId.endsWith(rId)) return true;
-        if (rId.endsWith(lId)) return true;
-        return false;
-      };
-      let found = lanes.find(l => matchId(l.id, roadId));
+      let found = lanes.find(l => matchLaneId(l.id, roadId));
       if (!found) {
         const loaded = await loadNearbyLanes();
-        found = (loaded || []).find((l: any) => matchId(l.id, roadId));
+        found = (loaded || []).find((l: any) => matchLaneId(l.id, roadId));
       }
       if (found) {
         setSelectedLane(found);
         setShowDetails(true);
         // 设置待填充的上报人信息，LaneDetails 会监听这个状态
+        setPendingRepairInfo(null);
+        setPendingReportReviewInfo(null);
         setPendingEditInfo(reporterInfo || null);
-        if (map) map.flyTo([found.coordinates[0].lat, found.coordinates[0].lng], 16);
+        flyToLane(found, 16);
       } else {
         setSelectedLane({ id: roadId, roadName: roadId, coordinates: [{ lat: map?.getCenter().lat || 0, lng: map?.getCenter().lng || 0 }], laneCount: 0 } as any);
         setShowDetails(true);
+        setPendingRepairInfo(null);
+        setPendingReportReviewInfo(null);
         setPendingEditInfo(reporterInfo || null);
       }
     };
     window.addEventListener('open-lane-edit', handler as EventListener);
     return () => window.removeEventListener('open-lane-edit', handler as EventListener);
   }, [lanes, map]);
+
+  // 监听从消息盒子跳转并自动打开维修报告（维修方“处理”）
+  useEffect(() => {
+    const handler = async (e: any) => {
+      const roadId = e?.detail?.roadId;
+      const roadName = e?.detail?.roadName;
+      if (!roadId) return;
+
+      let found = lanes.find(l => matchLaneId(l.id, roadId));
+      if (!found) {
+        const loaded = await loadNearbyLanes();
+        found = (loaded || []).find((l: any) => matchLaneId(l.id, roadId));
+      }
+
+      if (found) {
+        setSelectedLane(found);
+        setShowDetails(true);
+        flyToLane(found, 16);
+      } else {
+        setSelectedLane({
+          id: roadId,
+          roadName: roadName || roadId,
+          coordinates: [{ lat: map?.getCenter().lat || 0, lng: map?.getCenter().lng || 0 }],
+          laneCount: 0,
+        } as any);
+        setShowDetails(true);
+      }
+
+      setPendingEditInfo(null);
+      setPendingReportReviewInfo(null);
+      setPendingRepairInfo({ roadId, roadName: roadName || found?.roadName || roadId });
+    };
+
+    window.addEventListener('open-lane-repair', handler as EventListener);
+    return () => window.removeEventListener('open-lane-repair', handler as EventListener);
+  }, [lanes, map]);
+
+  // 监听管理员从消息盒子打开“维修记录查看”
+  useEffect(() => {
+    const handler = async (e: any) => {
+      const roadId = e?.detail?.roadId;
+      const reportId = e?.detail?.reportId;
+      if (!roadId) return;
+
+      let found = lanes.find(l => matchLaneId(l.id, roadId));
+      if (!found) {
+        const loaded = await loadNearbyLanes();
+        found = (loaded || []).find((l: any) => matchLaneId(l.id, roadId));
+      }
+
+      if (found) {
+        setSelectedLane(found);
+        setShowDetails(true);
+        flyToLane(found, 16);
+      } else {
+        setSelectedLane({ id: roadId, roadName: roadId, coordinates: [{ lat: map?.getCenter().lat || 0, lng: map?.getCenter().lng || 0 }], laneCount: 0 } as any);
+        setShowDetails(true);
+      }
+
+      setPendingEditInfo(null);
+      setPendingRepairInfo(null);
+      setPendingReportReviewInfo({ roadId, reportId: reportId || null });
+    };
+
+    window.addEventListener('open-lane-report-review', handler as EventListener);
+    return () => window.removeEventListener('open-lane-report-review', handler as EventListener);
+  }, [lanes, map]);
+
+  // 监听外部路况更新（如消息盒子审核/确认）并同步地图与详情
+  useEffect(() => {
+    const handler = (e: any) => {
+      const roadId = e?.detail?.roadId;
+      const roadName = e?.detail?.roadName;
+      const condition = e?.detail?.condition;
+      const record = e?.detail?.record;
+      if (!roadId || !condition) return;
+
+      const updatedDate = formatDateShort(record?.last_updated) || formatDateShort(new Date()) || '';
+
+      setLanes(prev => prev.map(l => {
+        if (!matchLaneId(l.id, roadId)) return l;
+        return {
+          ...l,
+          condition,
+          roadName: roadName || l.roadName,
+          lastUpdated: updatedDate || l.lastUpdated,
+        } as any;
+      }));
+
+      setSelectedLane(prev => {
+        if (!prev || !matchLaneId(prev.id, roadId)) return prev;
+        return {
+          ...prev,
+          condition,
+          roadName: roadName || prev.roadName,
+          lastUpdated: updatedDate || prev.lastUpdated,
+        } as any;
+      });
+    };
+
+    window.addEventListener('road-condition-updated', handler as EventListener);
+    return () => window.removeEventListener('road-condition-updated', handler as EventListener);
+  }, []);
 
 
   useEffect(() => {
@@ -663,6 +796,7 @@ const App: React.FC = () => {
           setSelectedLaneIds(prev => prev.includes(lane.id) ? prev : [...prev, lane.id]);
         } else {
           setSelectedLane(lane);
+          setShowDetails(true);
         }
       });
       polyLinesRef.current.push(polyline);
@@ -781,7 +915,8 @@ const App: React.FC = () => {
 
   const handleSelectLane = (lane: LaneInfo) => {
     setSelectedLane(lane);
-    if (map) map.flyTo([lane.coordinates[0].lat, lane.coordinates[0].lng], 16);
+    setShowDetails(true);
+    flyToLane(lane, 16);
   };
 
   const handleLocateMe = () => {
@@ -807,9 +942,6 @@ const App: React.FC = () => {
       setKernelShown(false);
     }
   }, [selectedAreaAnalysis]);
-
-  // 当选中路段变化时自动展开详情
-  useEffect(() => { if (selectedLane) setShowDetails(true); }, [selectedLane]);
 
   // 当选中路段变化时自动展开详情
   useEffect(() => { if (selectedLane) setShowDetails(true); }, [selectedLane]);
@@ -879,6 +1011,7 @@ const App: React.FC = () => {
                   const conditionWeight = (cond?: string) => {
                     if (cond === 'Poor') return 1.8;
                     if (cond === 'Fair') return 1.4;
+                    if (cond === 'InRepair') return 1.3;
                     if (cond === 'Good') return 1.0;
                     if (cond === 'Excellent') return 0.8;
                     return 1.0;
@@ -918,7 +1051,7 @@ const App: React.FC = () => {
                   }));
                   const totalDamagePoints = points.length;
                   const poorRoads = roadStats.filter(r => r.condition === 'Poor').length;
-                  const fairRoads = roadStats.filter(r => r.condition === 'Fair').length;
+                  const fairRoads = roadStats.filter(r => r.condition === 'Fair' || r.condition === 'InRepair').length;
                   
                   if (points.length === 0 && roadStats.every(r => r.damageCount === 0)) {
                     // 没有上报点，但仍可显示道路状况统计
@@ -933,7 +1066,7 @@ const App: React.FC = () => {
                   // 显示加载指示，尤其在 bbox 仍在补全时
                   setSelectedAreaAnalysis(null);
                   setSelectedAreaAnalysis({ info: '正在运行分析（会在数据补全后更新）' });
-                  import('./services/spatialAnalysis').then(mod => {
+                  {
                     // 自适应带宽/分辨率：依据选区对角线自动选取
                     const lats = points.map(p => p.lat);
                     const lngs = points.map(p => p.lng);
@@ -982,11 +1115,11 @@ const App: React.FC = () => {
                     setSelectedAreaLoading(true);
                     setTimeout(() => {
                       try {
-                        const hs = mod.computeGetisOrdGi(usedPoints, { bandwidthMeters: bandwidth });
-                        const report = mod.interpretHotspots(hs);
-                        const kd = mod.computeKernelDensity(usedPoints, { bandwidthMeters: bandwidth, cellSizeMeters: cellSize, normalize: true, bbox: [minLng, minLat, maxLng, maxLat] });
+                        const hs = computeGetisOrdGi(usedPoints, { bandwidthMeters: bandwidth });
+                        const report = interpretHotspots(hs);
+                        const kd = computeKernelDensity(usedPoints, { bandwidthMeters: bandwidth, cellSizeMeters: cellSize, normalize: true, bbox: [minLng, minLat, maxLng, maxLat] });
                         // 聚合到路段级热点（只统计路段上的点，不用整个矩形）
-                        const roadHotspots = mod.aggregateHotspotsByRoad(hs);
+                        const roadHotspots = aggregateHotspotsByRoad(hs);
                         // 若已有热力图层，先移除以免叠加旧图层
                         try { if (kernelLayerRef.current) { kernelLayerRef.current.remove(); kernelLayerRef.current = null; setKernelShown(false); } } catch(e) {}
                         setSelectedAreaAnalysis({ hotspots: hs, kernel: kd, report, roadHotspots, _note: ops > MAX_OPS ? '已对数据或分辨率进行自动降级以保证性能' : undefined, _params: { bandwidth, cellSize } });
@@ -997,11 +1130,7 @@ const App: React.FC = () => {
                         setSelectedAreaLoading(false);
                       }
                     }, 50);
-
-                  }).catch(err => {
-                    console.error('动态导入 spatialAnalysis 失败：', err);
-                    setSelectedAreaAnalysis({ error: '分析失败（模块加载失败）' });
-                  });
+                  }
                 }}
               >{selectedAreaLoading ? '加载路段中...' : '分析选中区域'}</button>
 
@@ -1055,17 +1184,14 @@ const App: React.FC = () => {
                         permissions={permissions}
                         pendingEditInfo={pendingEditInfo}
                         onEditInfoConsumed={() => setPendingEditInfo(null)}
+                        pendingRepairInfo={pendingRepairInfo}
+                        onRepairInfoConsumed={() => setPendingRepairInfo(null)}
+                        pendingReportReviewInfo={pendingReportReviewInfo}
+                        onReportReviewInfoConsumed={() => setPendingReportReviewInfo(null)}
                         onSaved={async (record?: any) => {
                           // 如果后端返回了 record，就用它更新前端状态，避免额外请求
                           if (record) {
                             console.log('onSaved record:', record, 'selectedLane before:', selectedLane?.id);
-                            const matchId = (lId: string, rId: string) => {
-                              if (!lId || !rId) return false;
-                              if (lId === rId) return true;
-                              if (lId.endsWith(rId)) return true;
-                              if (rId.endsWith(lId)) return true;
-                              return false;
-                            };
 
                             // 优先尝试精确匹配（只更新一条路段）
                             let updatedOne = false;
@@ -1082,7 +1208,7 @@ const App: React.FC = () => {
                               }
 
                               // 若无精确匹配，尝试一次模糊匹配（仅更新第一个匹配项）
-                              const fuzzyIdx = prev.findIndex(l => matchId(l.id, record.road_id));
+                              const fuzzyIdx = prev.findIndex(l => matchLaneId(l.id, record.road_id));
                               if (fuzzyIdx !== -1) {
                                 updatedOne = true;
                                 return prev.map((l, i) => i === fuzzyIdx ? ({
@@ -1109,7 +1235,7 @@ const App: React.FC = () => {
                               }
                               // 如果我们通过模糊匹配更新了某条但它不是当前打开的详情，则尝试把它设为 selectedLane（保持与列表同步）
                               if (!prev || !updatedOne) return prev;
-                              const found = lanes.find(l => matchId(l.id, record.road_id));
+                              const found = lanes.find(l => matchLaneId(l.id, record.road_id));
                               if (found) return found;
                               return prev;
                             });
@@ -1119,19 +1245,14 @@ const App: React.FC = () => {
                           // 否则回退到原来的策略：尝试从后端读取该记录，若失败则刷新地图数据
                           if (!selectedLane) return;
                           try {
-                            const res = await fetch(`/api/road-condition/${selectedLane.id}`);
-                            if (res.status === 404) {
+                            const dbRec = await roadApi.get(selectedLane.id);
+                            setSelectedLane(prev => prev && prev.id === dbRec.road_id ? { ...prev, condition: dbRec.condition || prev.condition, lastUpdated: dbRec.last_updated || prev.lastUpdated } : prev);
+                            setLanes(prev => prev.map(l => l.id === dbRec.road_id ? { ...l, condition: dbRec.condition || l.condition, lastUpdated: dbRec.last_updated || l.lastUpdated } : l));
+                          } catch (err: any) {
+                            if (err?.status === 404) {
                               // 无记录则跳过，不再报错刷屏
                               return;
                             }
-                            if (res.ok) {
-                              const dbRec = await res.json();
-                              setSelectedLane(prev => prev && prev.id === dbRec.road_id ? { ...prev, condition: dbRec.condition || prev.condition, lastUpdated: dbRec.last_updated || prev.lastUpdated } : prev);
-                              setLanes(prev => prev.map(l => l.id === dbRec.road_id ? { ...l, condition: dbRec.condition || l.condition, lastUpdated: dbRec.last_updated || l.lastUpdated } : l));
-                            } else {
-                              await loadNearbyLanes();
-                            }
-                          } catch (err) {
                             console.error('同步后端记录失败：', err);
                             await loadNearbyLanes();
                           }
@@ -1290,8 +1411,8 @@ const App: React.FC = () => {
                                 <div className="text-xs text-red-500">较差</div>
                               </div>
                               <div className="bg-amber-50 rounded-lg p-3 text-center">
-                                <div className="text-xl font-bold text-amber-600">{lanes.filter(l => selectedLaneIds.includes(l.id) && l.condition === 'Fair').length}</div>
-                                <div className="text-xs text-amber-500">一般</div>
+                                <div className="text-xl font-bold text-amber-600">{lanes.filter(l => selectedLaneIds.includes(l.id) && (l.condition === 'Fair' || l.condition === 'InRepair')).length}</div>
+                                <div className="text-xs text-amber-500">一般/维修中</div>
                               </div>
                               <div className="bg-green-50 rounded-lg p-3 text-center">
                                 <div className="text-xl font-bold text-green-600">{lanes.filter(l => selectedLaneIds.includes(l.id) && (l.condition === 'Good' || l.condition === 'Excellent')).length}</div>
@@ -1313,32 +1434,34 @@ const App: React.FC = () => {
                           {(() => {
                             const selectedLanes = lanes.filter(l => selectedLaneIds.includes(l.id));
                             const sortedLanes = [...selectedLanes].sort((a, b) => {
-                              const severityOrder = { 'Poor': 0, 'Fair': 1, 'Good': 2, 'Excellent': 3, '未知': 4 };
+                              const severityOrder = { 'Poor': 0, 'Fair': 1, 'InRepair': 1, 'Good': 2, 'Excellent': 3, '未知': 4 };
                               return (severityOrder[a.condition as keyof typeof severityOrder] ?? 4) - (severityOrder[b.condition as keyof typeof severityOrder] ?? 4);
                             });
                             return sortedLanes.length > 0 ? (
                               <div className="space-y-2">
                                 {sortedLanes.slice(0, 10).map((lane, idx: number) => {
                                   const conditionStyle = lane.condition === 'Poor' ? 'text-red-600 bg-red-50' :
+                                    lane.condition === 'InRepair' ? 'text-orange-600 bg-orange-50' :
                                     lane.condition === 'Fair' ? 'text-amber-600 bg-amber-50' :
                                     lane.condition === 'Good' ? 'text-green-600 bg-green-50' :
                                     lane.condition === 'Excellent' ? 'text-emerald-600 bg-emerald-50' : 'text-slate-600 bg-slate-100';
                                   const conditionText = lane.condition === 'Poor' ? '较差' :
+                                    lane.condition === 'InRepair' ? '维修中' :
                                     lane.condition === 'Fair' ? '一般' :
                                     lane.condition === 'Good' ? '良好' :
                                     lane.condition === 'Excellent' ? '优良' : '未知';
                                   return (
                                     <div key={idx} className="flex items-center gap-3 p-3 rounded-lg bg-slate-50 hover:bg-slate-100 transition">
-                                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-sm font-bold ${lane.condition === 'Poor' ? 'bg-red-500 text-white' : lane.condition === 'Fair' ? 'bg-amber-500 text-white' : 'bg-slate-200 text-slate-600'}`}>{idx + 1}</div>
+                                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-sm font-bold ${lane.condition === 'Poor' ? 'bg-red-500 text-white' : lane.condition === 'Fair' || lane.condition === 'InRepair' ? 'bg-amber-500 text-white' : 'bg-slate-200 text-slate-600'}`}>{idx + 1}</div>
                                       <div className="flex-1 min-w-0">
                                         <div className="font-medium text-sm text-slate-800 truncate">{lane.roadName || lane.id}</div>
-                                        <div className="text-xs text-slate-500">长度：{(lane.length || 0).toFixed(0)}米</div>
+                                        <div className="text-xs text-slate-500">长度：{getLaneLengthMeters(lane).toFixed(0)}米</div>
                                       </div>
                                       <div className={`px-2 py-1 rounded text-xs font-medium ${conditionStyle}`}>{conditionText}</div>
                                       <button className="px-2 py-1 bg-white border rounded text-xs hover:bg-slate-50" onClick={() => {
-                                        if (!map) return;
                                         setSelectedLane(lane);
-                                        try { map.flyTo([lane.coordinates[0].lat, lane.coordinates[0].lng], 16); } catch(e) {}
+                                        setShowDetails(true);
+                                        flyToLane(lane, 16);
                                       }}>定位</button>
                                     </div>
                                   );
@@ -1360,7 +1483,7 @@ const App: React.FC = () => {
                             id: l.id,
                             roadName: l.roadName,
                             condition: l.condition,
-                            length: l.length
+                            length: getLaneLengthMeters(l)
                           })),
                           report: selectedAreaAnalysis.report,
                           exportTime: new Date().toISOString()
@@ -1466,352 +1589,22 @@ const App: React.FC = () => {
 
         {/* 百度街景弹窗 */}
         {streetViewLocation && (
-          <div className="fixed inset-0 z-[5000] bg-black/70 flex items-center justify-center p-4" onClick={() => setStreetViewLocation(null)}>
-            <div className="bg-white rounded-2xl w-[960px] max-w-[96vw] h-[620px] max-h-[90vh] flex flex-col shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
-              <div className="flex items-center justify-between p-4 border-b border-slate-100">
-                <h3 className="text-lg font-bold flex items-center gap-2">
-                  <MapPin className="w-5 h-5 text-indigo-500" />
-                  百度街景
-                </h3>
-                <button className="p-2 hover:bg-slate-100 rounded-full transition-colors" onClick={() => setStreetViewLocation(null)}>
-                  <X className="w-5 h-5 text-slate-500" />
-                </button>
-              </div>
-              <div className="flex-1 bg-slate-50 flex items-center justify-center relative">
-                {baiduAk ? (
-                  <iframe
-                    title="百度街景"
-                    className="w-full h-full"
-                    src={`https://api.map.baidu.com/panorama/v2?ak=${encodeURIComponent(baiduAk)}&width=1024&height=512&location=${streetViewLocation.lng},${streetViewLocation.lat}&fov=360`}
-                    allowFullScreen
-                  />
-                ) : (
-                  <div className="text-center p-10">
-                    <div className="w-16 h-16 bg-indigo-100 text-indigo-500 rounded-full flex items-center justify-center mx-auto mb-4">
-                      <MapPin className="w-8 h-8" />
-                    </div>
-                    <h4 className="text-lg font-bold text-slate-700 mb-2">街景服务未配置</h4>
-                    <p className="text-sm text-slate-500 mb-4">请在 .env.local 中设置 VITE_BAIDU_AK 后再试。</p>
-                    <p className="text-xs text-slate-400 max-w-xs mx-auto">当前坐标：{streetViewLocation.lat.toFixed(6)}, {streetViewLocation.lng.toFixed(6)}</p>
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
+          <StreetViewModal
+            location={streetViewLocation}
+            baiduAk={baiduAk}
+            onClose={() => setStreetViewLocation(null)}
+          />
         )}
 
         {/* 图片预览 + 病害分析 */}
         {viewPhotoUrl && (
-          <div className="fixed inset-0 z-[5000] bg-black/60 flex items-center justify-center p-4" onClick={() => { setViewPhotoUrl(null); setPhotoAnalysis(null); setPhotoAnalysisError(null); setPhotoAnalysisLoading(false); }}>
-            <div className="bg-white flex flex-row max-w-[96vw] max-h-[94vh] w-[1200px] h-[85vh] relative rounded-2xl shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
-              <button
-                className="absolute top-3 right-3 p-2 bg-white/80 hover:bg-white rounded-full transition-colors text-slate-600 z-10 shadow-sm"
-                onClick={() => { setViewPhotoUrl(null); setPhotoAnalysis(null); setPhotoAnalysisError(null); setPhotoAnalysisLoading(false); }}
-                aria-label="关闭图片预览"
-              >
-                <X className="w-5 h-5" />
-              </button>
-
-              {/* 左侧：图片区域（占主导 ~65%） */}
-              <div className="flex-[3] flex flex-col bg-slate-900 min-w-0">
-                <div className="flex-1 flex items-center justify-center p-2 relative overflow-hidden">
-                  <img
-                    src={viewPhotoUrl}
-                    alt="预览图"
-                    className="w-full h-full object-contain"
-                    style={{ maxHeight: 'calc(85vh - 60px)' }}
-                  />
-                  {/* 图片上的分析标注覆盖层 */}
-                  {photoAnalysis?.highlight_regions && photoAnalysis.highlight_regions.length > 0 && (
-                    <div className="absolute bottom-4 left-4 right-4 flex flex-wrap gap-2">
-                      {photoAnalysis.highlight_regions.map((region: any, idx: number) => (
-                        <div key={idx} className="bg-red-500/90 text-white text-xs px-3 py-1.5 rounded-full backdrop-blur-sm flex items-center gap-1.5 cursor-default hover:bg-red-600 transition-colors" title={region.description}>
-                          <AlertTriangle className="w-3 h-3" />
-                          <span>{region.label}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-                {/* 底部图片信息栏 */}
-                <div className="bg-slate-800 px-5 py-3 flex items-center justify-between text-xs text-slate-400 border-t border-slate-700">
-                  <span>道路：{selectedLane?.roadName || '未知'}</span>
-                  {photoAnalysis && (
-                    <div className="flex items-center gap-3">
-                      <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${photoAnalysis.severity === '严重' ? 'bg-red-500/20 text-red-400' : photoAnalysis.severity === '中等' ? 'bg-amber-500/20 text-amber-400' : 'bg-green-500/20 text-green-400'}`}>
-                        {photoAnalysis.severity || '未知'}
-                      </span>
-                      {photoAnalysis.severity_score && (
-                        <span>评分：{photoAnalysis.severity_score}/10</span>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* 右侧：分析面板（~35%） */}
-              <div className="flex-[2] flex flex-col min-w-[340px] max-w-[400px] border-l border-slate-200 bg-white">
-                {/* 头部 - 固定 */}
-                <div className="px-5 py-4 pt-14 border-b border-slate-100 flex items-center justify-between flex-shrink-0 bg-white z-10">
-                  <div className="flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-indigo-500"></div>
-                    <span className="font-bold text-slate-900 text-sm">智能病害诊断</span>
-                  </div>
-                  <button
-                    className="px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
-                    onClick={async () => {
-                      if (!viewPhotoUrl) return;
-                      setPhotoAnalysisLoading(true);
-                      setPhotoAnalysisError(null);
-                      setPhotoAnalysis(null);
-                      const res = await analyzeDamagePhoto(viewPhotoUrl, { roadName: selectedLane?.roadName, locationText: selectedLane ? `${selectedLane.coordinates?.[0]?.lat?.toFixed?.(5) || ''}, ${selectedLane.coordinates?.[0]?.lng?.toFixed?.(5) || ''}` : undefined });
-                      if (!res || res.error) {
-                        setPhotoAnalysisError(res?.error || '分析失败，请稍后重试');
-                        setPhotoAnalysisLoading(false);
-                        return;
-                      }
-                      setPhotoAnalysis(res.data);
-                      setPhotoAnalysisLoading(false);
-                    }}
-                    disabled={photoAnalysisLoading}
-                  >
-                    {photoAnalysisLoading ? (
-                      <span className="flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" />分析中...</span>
-                    ) : '开始分析'}
-                  </button>
-                </div>
-
-                {/* 可滚动内容区域 */}
-                <div className="flex-1 overflow-y-auto px-5 py-4">
-                {photoAnalysisError && <div className="text-sm text-red-600 bg-red-50 rounded-lg p-3 mb-3">{photoAnalysisError}</div>}
-
-                  {photoAnalysisLoading && (
-                    <div className="flex flex-col items-center justify-center py-16 gap-3">
-                      <Loader2 className="w-10 h-10 animate-spin text-indigo-500" />
-                      <div className="text-sm text-slate-500">正在分析病害特征...</div>
-                      <div className="text-xs text-slate-400">正在识别病害类型、评估严重度并生成维修方案</div>
-                    </div>
-                  )}
-
-                {photoAnalysis && !photoAnalysisLoading ? (
-                    <div className="space-y-4 text-sm">
-                      {/* 1. 病害诊断 */}
-                      <div className="rounded-xl border border-slate-200 overflow-hidden">
-                        <div className="bg-gradient-to-r from-red-50 to-orange-50 px-4 py-2.5 border-b border-slate-100">
-                          <div className="font-bold text-slate-800 text-xs flex items-center gap-2">
-                            <span className="w-5 h-5 rounded-full bg-red-100 text-red-600 flex items-center justify-center text-[10px] font-black">1</span>
-                            病害诊断
-                          </div>
-                        </div>
-                        <div className="p-4 space-y-2.5">
-                          <div className="flex items-center justify-between">
-                            <span className="text-slate-500 text-xs">病害类型</span>
-                            <span className="font-semibold text-slate-900">{photoAnalysis.damage_type || '未知'}</span>
-                          </div>
-                          <div className="flex items-center justify-between">
-                            <span className="text-slate-500 text-xs">严重等级</span>
-                            <span className={`font-semibold ${photoAnalysis.severity === '严重' ? 'text-red-600' : photoAnalysis.severity === '中等' ? 'text-amber-600' : 'text-green-600'}`}>{photoAnalysis.severity || '未知'}</span>
-                          </div>
-                          {photoAnalysis.severity_score && (
-                            <div>
-                              <div className="flex items-center justify-between mb-1">
-                                <span className="text-slate-500 text-xs">严重度评分</span>
-                                <span className="font-semibold text-slate-700">{photoAnalysis.severity_score}/10</span>
-                              </div>
-                              <div className="w-full bg-slate-100 rounded-full h-2">
-                                <div className={`h-2 rounded-full transition-all ${photoAnalysis.severity_score >= 7 ? 'bg-red-500' : photoAnalysis.severity_score >= 4 ? 'bg-amber-500' : 'bg-green-500'}`} style={{ width: `${photoAnalysis.severity_score * 10}%` }}></div>
-                              </div>
-                            </div>
-                          )}
-                          {photoAnalysis.dimensions && (
-                            <div className="bg-slate-50 rounded-lg p-2.5 mt-1 grid grid-cols-2 gap-2">
-                              {photoAnalysis.dimensions.estimated_length && <div><div className="text-[10px] text-slate-400">估算长度</div><div className="text-xs font-semibold text-slate-700">{photoAnalysis.dimensions.estimated_length}</div></div>}
-                              {photoAnalysis.dimensions.estimated_width && <div><div className="text-[10px] text-slate-400">估算宽度</div><div className="text-xs font-semibold text-slate-700">{photoAnalysis.dimensions.estimated_width}</div></div>}
-                              {photoAnalysis.dimensions.estimated_depth && <div><div className="text-[10px] text-slate-400">估算深度</div><div className="text-xs font-semibold text-slate-700">{photoAnalysis.dimensions.estimated_depth}</div></div>}
-                              {photoAnalysis.dimensions.estimated_area && <div><div className="text-[10px] text-slate-400">影响面积</div><div className="text-xs font-semibold text-slate-700">{photoAnalysis.dimensions.estimated_area}</div></div>}
-                            </div>
-                          )}
-                          {photoAnalysis.reasoning && <div className="text-xs text-slate-500 mt-2 bg-blue-50 rounded-lg p-2.5 border border-blue-100">💡 {photoAnalysis.reasoning}</div>}
-                        </div>
-                      </div>
-
-                      {/* 2. 成因分析 */}
-                      {photoAnalysis.cause_analysis && (
-                        <div className="rounded-xl border border-slate-200 overflow-hidden">
-                          <div className="bg-gradient-to-r from-purple-50 to-pink-50 px-4 py-2.5 border-b border-slate-100">
-                            <div className="font-bold text-slate-800 text-xs flex items-center gap-2">
-                              <span className="w-5 h-5 rounded-full bg-purple-100 text-purple-600 flex items-center justify-center text-[10px] font-black">2</span>
-                              损伤成因分析
-                            </div>
-                          </div>
-                          <div className="p-4 space-y-2">
-                            <div><span className="text-slate-500 text-xs">主因：</span><span className="text-slate-800 font-medium text-xs">{photoAnalysis.cause_analysis.primary_cause}</span></div>
-                            {photoAnalysis.cause_analysis.contributing_factors && photoAnalysis.cause_analysis.contributing_factors.length > 0 && (
-                              <div className="flex flex-wrap gap-1.5 mt-1">
-                                {photoAnalysis.cause_analysis.contributing_factors.map((f: string, idx: number) => (
-                                  <span key={idx} className="px-2 py-0.5 bg-purple-50 text-purple-700 rounded-md text-[11px]">{f}</span>
-                                ))}
-                              </div>
-                            )}
-                            {photoAnalysis.cause_analysis.progression_risk && <div className="text-xs text-amber-700 bg-amber-50 p-2 rounded-lg mt-1">⚠️ {photoAnalysis.cause_analysis.progression_risk}</div>}
-                          </div>
-                        </div>
-                      )}
-
-                      {/* 3. 维修材料与工艺 */}
-                      <div className="rounded-xl border border-slate-200 overflow-hidden">
-                        <div className="bg-gradient-to-r from-blue-50 to-cyan-50 px-4 py-2.5 border-b border-slate-100">
-                          <div className="font-bold text-slate-800 text-xs flex items-center gap-2">
-                            <span className="w-5 h-5 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center text-[10px] font-black">3</span>
-                            维修方案与材料
-                          </div>
-                        </div>
-                        <div className="p-4 space-y-3">
-                          <div className="flex items-center gap-3 flex-wrap">
-                            <div className="flex items-center gap-1.5">
-                              <span className={`w-2 h-2 rounded-full ${photoAnalysis.maintenance?.urgency === '立即' ? 'bg-red-500 animate-pulse' : photoAnalysis.maintenance?.urgency?.includes('短期') ? 'bg-amber-500' : 'bg-green-500'}`}></span>
-                              <span className="text-xs font-semibold text-slate-700">{photoAnalysis.maintenance?.urgency || '待评估'}</span>
-                            </div>
-                            {photoAnalysis.maintenance?.technique && (
-                              <span className="px-2.5 py-0.5 bg-blue-100 text-blue-700 rounded-full text-[11px] font-medium">{photoAnalysis.maintenance.technique}</span>
-                            )}
-                            {photoAnalysis.maintenance?.estimated_cost && (
-                              <span className="text-xs text-slate-500">💰 {photoAnalysis.maintenance.estimated_cost}</span>
-                            )}
-                          </div>
-                          {photoAnalysis.maintenance?.actions && photoAnalysis.maintenance.actions.length > 0 && (
-                            <div className="space-y-1.5">
-                              <div className="text-[11px] text-slate-400 font-semibold">维修步骤</div>
-                              {photoAnalysis.maintenance.actions.map((a: string, idx: number) => (
-                                <div key={idx} className="flex items-start gap-2 text-xs text-slate-700">
-                                  <span className="w-4 h-4 rounded-full bg-blue-50 text-blue-600 flex items-center justify-center text-[10px] font-bold flex-shrink-0 mt-0.5">{idx + 1}</span>
-                                  {a}
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                          {photoAnalysis.maintenance?.materials && photoAnalysis.maintenance.materials.length > 0 && (
-                            <div>
-                              <div className="text-[11px] text-slate-400 font-semibold mb-2">所需材料</div>
-                              <div className="space-y-1.5">
-                                {photoAnalysis.maintenance.materials.map((m: any, idx: number) => (
-                                  <div key={idx} className="bg-slate-50 rounded-lg p-2.5 border border-slate-100">
-                                    <div className="font-medium text-xs text-slate-800">{m.name}{m.spec ? ` (${m.spec})` : ''}</div>
-                                    <div className="text-[11px] text-slate-500 mt-0.5">{m.usage}{m.unit_amount ? ` · 用量：${m.unit_amount}` : ''}</div>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                          {photoAnalysis.maintenance?.equipment && photoAnalysis.maintenance.equipment.length > 0 && (
-                            <div className="flex flex-wrap gap-1.5">
-                              <span className="text-[11px] text-slate-400">设备：</span>
-                              {photoAnalysis.maintenance.equipment.map((eq: string, idx: number) => (
-                                <span key={idx} className="px-2 py-0.5 bg-slate-100 text-slate-600 rounded-md text-[11px]">{eq}</span>
-                              ))}
-                            </div>
-                          )}
-                          <div className="flex items-center gap-4 text-[11px] text-slate-500">
-                            {photoAnalysis.maintenance?.work_duration && <span>⏱ 工期：{photoAnalysis.maintenance.work_duration}</span>}
-                            {photoAnalysis.maintenance?.quality_standard && <span>✅ {photoAnalysis.maintenance.quality_standard}</span>}
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* 4. 通行管控 */}
-                      <div className="rounded-xl border border-slate-200 overflow-hidden">
-                        <div className="bg-gradient-to-r from-amber-50 to-yellow-50 px-4 py-2.5 border-b border-slate-100">
-                          <div className="font-bold text-slate-800 text-xs flex items-center gap-2">
-                            <span className="w-5 h-5 rounded-full bg-amber-100 text-amber-600 flex items-center justify-center text-[10px] font-black">4</span>
-                            通行管控
-                          </div>
-                        </div>
-                        <div className="p-4 space-y-2">
-                          <div className="text-xs text-slate-700">{photoAnalysis.traffic?.impact || '影响待评估'}</div>
-                          <div className="flex items-center gap-3 flex-wrap text-xs">
-                            {photoAnalysis.traffic?.risk_level && (
-                              <span className={`px-2 py-0.5 rounded-full font-semibold ${photoAnalysis.traffic.risk_level === '高' ? 'bg-red-100 text-red-700' : photoAnalysis.traffic.risk_level === '中' ? 'bg-amber-100 text-amber-700' : 'bg-green-100 text-green-700'}`}>
-                                风险:{photoAnalysis.traffic.risk_level}
-                              </span>
-                            )}
-                            {photoAnalysis.traffic?.speed_limit && <span className="px-2 py-0.5 bg-slate-100 text-slate-600 rounded-full">限速 {photoAnalysis.traffic.speed_limit}</span>}
-                            {photoAnalysis.traffic?.closure_needed && <span className="px-2 py-0.5 bg-red-100 text-red-700 rounded-full font-semibold">需封闭施工</span>}
-                          </div>
-                          {photoAnalysis.traffic?.advice && <div className="text-xs text-slate-600 bg-amber-50 p-2 rounded-lg">📋 {photoAnalysis.traffic.advice}</div>}
-                        </div>
-                      </div>
-
-                      {/* 5. 养护建议 */}
-                      {photoAnalysis.lane_care_tips && photoAnalysis.lane_care_tips.length > 0 && (
-                        <div className="rounded-xl border border-slate-200 overflow-hidden">
-                          <div className="bg-gradient-to-r from-green-50 to-emerald-50 px-4 py-2.5 border-b border-slate-100">
-                            <div className="font-bold text-slate-800 text-xs flex items-center gap-2">
-                              <span className="w-5 h-5 rounded-full bg-green-100 text-green-600 flex items-center justify-center text-[10px] font-black">5</span>
-                              日常养护建议
-                            </div>
-                          </div>
-                          <div className="p-4 space-y-2">
-                            {photoAnalysis.lane_care_tips.map((tip: string, idx: number) => (
-                              <div key={idx} className="flex items-start gap-2 text-xs text-slate-700">
-                                <span className="text-green-500 mt-0.5">●</span>
-                                {tip}
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-
-                      {/* 发送给维修方按钮 */}
-                      <div className="pt-4 border-t border-slate-100">
-                        <button
-                          className="w-full py-3 bg-gradient-to-r from-amber-500 to-orange-500 text-white rounded-xl font-semibold text-sm hover:from-amber-600 hover:to-orange-600 transition-all flex items-center justify-center gap-2"
-                          onClick={() => {
-                            // 格式化分析结果为可复制文本
-                            const analysisText = [
-                              `【病害诊断报告】`,
-                              `道路：${selectedLane?.roadName || '未知'}`,
-                              `病害类型：${photoAnalysis.damage_type || '未知'}`,
-                              `严重等级：${photoAnalysis.severity || '未知'}`,
-                              photoAnalysis.severity_score ? `严重度评分：${photoAnalysis.severity_score}/10` : '',
-                              photoAnalysis.dimensions ? `\n【尺寸估算】\n${photoAnalysis.dimensions.estimated_length ? `长度：${photoAnalysis.dimensions.estimated_length}` : ''}${photoAnalysis.dimensions.estimated_width ? ` 宽度：${photoAnalysis.dimensions.estimated_width}` : ''}${photoAnalysis.dimensions.estimated_depth ? ` 深度：${photoAnalysis.dimensions.estimated_depth}` : ''}` : '',
-                              photoAnalysis.cause_analysis ? `\n【成因分析】\n主因：${photoAnalysis.cause_analysis.primary_cause || ''}${photoAnalysis.cause_analysis.contributing_factors?.length ? `\n诱因：${photoAnalysis.cause_analysis.contributing_factors.join('、')}` : ''}` : '',
-                              photoAnalysis.maintenance ? `\n【维修方案】\n紧迫性：${photoAnalysis.maintenance.urgency || ''}${photoAnalysis.maintenance.technique ? `\n工艺：${photoAnalysis.maintenance.technique}` : ''}${photoAnalysis.maintenance.actions?.length ? `\n步骤：\n${photoAnalysis.maintenance.actions.map((a: string, i: number) => `${i+1}. ${a}`).join('\n')}` : ''}` : '',
-                              photoAnalysis.maintenance?.materials?.length ? `\n【材料清单】\n${photoAnalysis.maintenance.materials.map((m: any) => `- ${m.name}${m.spec ? `(${m.spec})` : ''}${m.unit_amount ? ` ${m.unit_amount}` : ''}`).join('\n')}` : '',
-                              photoAnalysis.traffic ? `\n【通行管控】\n${photoAnalysis.traffic.impact || ''}${photoAnalysis.traffic.risk_level ? ` 风险等级：${photoAnalysis.traffic.risk_level}` : ''}${photoAnalysis.traffic.closure_needed ? ' 需封闭施工' : ''}` : '',
-                              photoAnalysis.lane_care_tips?.length ? `\n【养护建议】\n${photoAnalysis.lane_care_tips.map((t: string) => `- ${t}`).join('\n')}` : '',
-                            ].filter(Boolean).join('\n');
-                            
-                            navigator.clipboard.writeText(analysisText).then(() => {
-                              alert('分析报告已复制到剪贴板，可粘贴到维修报告中');
-                            }).catch(() => {
-                              // 如果剪贴板API不可用，创建一个临时textarea
-                              const ta = document.createElement('textarea');
-                              ta.value = analysisText;
-                              document.body.appendChild(ta);
-                              ta.select();
-                              document.execCommand('copy');
-                              document.body.removeChild(ta);
-                              alert('分析报告已复制到剪贴板');
-                            });
-                          }}
-                        >
-                          📋 复制分析报告（发送给维修方）
-                        </button>
-                      </div>
-                    </div>
-                  ) : !photoAnalysisLoading && (
-                    <div className="flex flex-col items-center justify-center py-16 gap-4 text-center px-4">
-                      <div className="w-16 h-16 rounded-2xl bg-indigo-50 flex items-center justify-center">
-                        <AlertTriangle className="w-8 h-8 text-indigo-400" />
-                      </div>
-                      <div className="text-sm font-semibold text-slate-700">智能病害分析</div>
-                      <div className="text-xs text-slate-500 max-w-[240px]">点击上方"开始分析"按钮，AI 将自动识别病害类型、评估严重度，并给出维修材料清单、施工方案及养护建议。</div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          </div>
+          <PhotoAnalysisModal
+            key={viewPhotoUrl}
+            photoUrl={viewPhotoUrl}
+            roadName={selectedLane?.roadName}
+            locationText={selectedLane ? `${selectedLane.coordinates?.[0]?.lat?.toFixed?.(5) || ''}, ${selectedLane.coordinates?.[0]?.lng?.toFixed?.(5) || ''}` : undefined}
+            onClose={() => setViewPhotoUrl(null)}
+          />
         )}
         
         {/* 路面健康度监测面板 */}

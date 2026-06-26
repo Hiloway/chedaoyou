@@ -5,6 +5,7 @@ import MessageBox from './MessageBox';
 import ProfileModal from './ProfileModal';
 import { LaneInfo } from '../types';
 import { chatWithAssistant } from '../services/deepseekService';
+import { messageApi } from '../services/api';
 import { 
   Map as MapIcon, 
   Search, 
@@ -69,8 +70,7 @@ const Sidebar: React.FC<SidebarProps> = ({ lanes, onSelectLane, selectedLaneId, 
       if (!user || user.role !== 'admin') { setUnreadCount(0); return; }
       try {
         // 使用 count 接口避免拉取大量数据并减少后端排序开销
-        const resp = await fetch('/api/messages?unread=1&count=1');
-        const data = await resp.json();
+        const data = await messageApi.unreadCount();
         setUnreadCount((data && typeof data.count === 'number') ? data.count : 0);
       } catch (err) {
         console.error('fetch unread messages failed', err);
@@ -102,6 +102,7 @@ const Sidebar: React.FC<SidebarProps> = ({ lanes, onSelectLane, selectedLaneId, 
     switch (condition) {
       case 'Excellent':
       case 'Good': return 'bg-emerald-500';
+      case 'InRepair':
       case 'Fair': return 'bg-amber-500';
       case 'Poor': return 'bg-rose-500';
       default: return 'bg-slate-400';
@@ -171,12 +172,15 @@ const Sidebar: React.FC<SidebarProps> = ({ lanes, onSelectLane, selectedLaneId, 
                         'bg-blue-500 hover:bg-blue-400 text-white'
                       }`} 
                       onClick={() => setShowMessages(true)}
-                      title={user.role === 'admin' ? '查看所有上报消息' : user.role === 'maintainer' ? '查看分配的维修任务' : '查看我的上报反馈'}
+                      title={
+                        user.role === 'admin'
+                          ? `查看所有上报消息${unreadCount > 0 ? `（当前未读 ${unreadCount}）` : ''}`
+                          : user.role === 'maintainer'
+                            ? '查看分配的维修任务'
+                            : '查看我的上报反馈'
+                      }
                     >
                       {user.role === 'admin' ? '消息' : user.role === 'maintainer' ? '任务' : '反馈'}
-                      {unreadCount > 0 && (
-                        <span className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full w-5 h-5 text-[11px] flex items-center justify-center">{unreadCount}</span>
-                      )}
                     </button>
                   )}
                 </div>

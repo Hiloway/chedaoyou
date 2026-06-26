@@ -1,10 +1,10 @@
 
 import React, { useEffect, useState, useRef } from 'react';
-import axios from 'axios';
 import ReactDOM from 'react-dom';
 import { LaneInfo } from '../types';
 import { analyzeLaneData } from '../services/deepseekService';
 import { computeGetisOrdGi, computeKernelDensity, DamagePoint, analyzeLaneSummary } from '../services/spatialAnalysis';
+import { accountApi, roadApi, repairApi, messageApi } from '../services/api';
 import { 
   X, 
   ShieldCheck, 
@@ -31,9 +31,13 @@ interface LaneDetailsProps {
   onSaved?: (record?: any) => void; // 保存后回调，优先接收后端返回的记录
   pendingEditInfo?: any; // 从消息盒子跳转时自动填充的信息
   onEditInfoConsumed?: () => void; // 消费pendingEditInfo后的回调
+  pendingRepairInfo?: any; // 从消息盒子跳转时自动打开维修报告
+  onRepairInfoConsumed?: () => void; // 消费pendingRepairInfo后的回调
+  pendingReportReviewInfo?: any; // 从消息盒子跳转时自动打开维修记录
+  onReportReviewInfoConsumed?: () => void; // 消费pendingReportReviewInfo后的回调
 }
 
-const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissions, onSaved, pendingEditInfo, onEditInfoConsumed }) => {
+const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissions, onSaved, pendingEditInfo, onEditInfoConsumed, pendingRepairInfo, onRepairInfoConsumed, pendingReportReviewInfo, onReportReviewInfoConsumed }) => {
 
   const [analysis, setAnalysis] = useState<any>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -109,6 +113,7 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
       case 'Good': return { text: '良好', color: 'text-green-600', bg: 'bg-green-50', border: 'border-green-100' };
       case 'Fair': return { text: '一般', color: 'text-amber-600', bg: 'bg-amber-50', border: 'border-amber-100' };
       case 'Poor': return { text: '较差', color: 'text-red-600', bg: 'bg-red-50', border: 'border-red-400', highlight: true };
+      case 'InRepair': return { text: '维修中', color: 'text-orange-600', bg: 'bg-amber-50', border: 'border-amber-200', repairing: true };
       case '未知': return { text: '未知', color: 'text-gray-600', bg: 'bg-gray-50', border: 'border-gray-100' };
       default: return { text: condition || '未知', color: 'text-gray-600', bg: 'bg-gray-50', border: 'border-gray-100' };
     }
@@ -145,7 +150,9 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
   // 维修报告相关
   const [showRepairForm, setShowRepairForm] = useState(false);
   const [isReportSaving, setIsReportSaving] = useState(false);
+  const [isCompletingRepair, setIsCompletingRepair] = useState(false);
   const [showReports, setShowReports] = useState(false);
+  const [reportFocusId, setReportFocusId] = useState<number | null>(null);
 
   // 用户上报弹窗与状态
   const [showUserReport, setShowUserReport] = useState(false);
@@ -225,6 +232,26 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
     }
   }, [pendingEditInfo, permissions.canEdit, onEditInfoConsumed]);
 
+  // 监听从消息盒子“出力”跳转，自动打开维修报告填写
+  React.useEffect(() => {
+    if (!pendingRepairInfo) return;
+    if (user.role !== 'maintainer') return;
+    setTimeout(() => {
+      setShowRepairForm(true);
+      if (onRepairInfoConsumed) onRepairInfoConsumed();
+    }, 80);
+  }, [pendingRepairInfo, user.role, onRepairInfoConsumed]);
+
+  // 监听从消息盒子跳转到“查看维修报告”
+  React.useEffect(() => {
+    if (!pendingReportReviewInfo) return;
+    const targetRoadId = pendingReportReviewInfo.roadId;
+    if (targetRoadId && targetRoadId !== lane.id) return;
+    setReportFocusId(pendingReportReviewInfo?.reportId ? Number(pendingReportReviewInfo.reportId) : null);
+    setShowReports(true);
+    if (onReportReviewInfoConsumed) onReportReviewInfoConsumed();
+  }, [pendingReportReviewInfo, lane.id, onReportReviewInfoConsumed]);
+
   const [repairReport, setRepairReport] = useState<any>({
     title: '',
     start_stake: '',
@@ -253,8 +280,8 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
   // 获取维修方列表
   const fetchMaintainers = async () => {
     try {
-      const res = await axios.get('/api/maintainers');
-      setMaintainerList(res.data || []);
+      const data = await accountApi.maintainers();
+      setMaintainerList(data || []);
     } catch (err) {
       console.error('获取维修方列表失败:', err);
       setMaintainerList([]);
@@ -278,7 +305,7 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
     try {
       const taskText = `【维修任务指派】\n道路：${lane.roadName}\n状况：${(savedRecord?.condition || lane.condition) === 'Poor' ? '较差' : '一般'}\n破损类型：${savedRecord?.damage_type || '待检查'}\n严重程度：${savedRecord?.severity || '待评估'}\n描述：${savedRecord?.description || '无'}\n指派人：${user.username}\n指派时间：${new Date().toLocaleString()}${assignNote ? `\n备注：${assignNote}` : ''}`;
       
-      await axios.post('/api/message', {
+      await messageApi.create({
         road_id: lane.id,
         type: 'task',
         name: user.username,
@@ -295,6 +322,71 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
       alert('发送失败，请重试');
     } finally {
       setIsAssigning(false);
+    }
+  };
+
+  // 维修方提交“维修完成”申请，由管理员审核通过后再修改路况
+  const handleCompleteRepair = async () => {
+    const ok = window.confirm('确认提交“维修完成”申请？提交后将等待管理员审核。');
+    if (!ok) return;
+    setIsCompletingRepair(true);
+    try {
+      try {
+        await roadApi.upsert({
+          road_id: lane.id,
+          road_name: lane.roadName,
+          condition: 'InRepair',
+          workflow_action: 'request_completion',
+          actor_role: 'maintainer',
+          actor_name: user.username,
+          workflow_note: `维修方 ${user.username} 提交维修完成申请`,
+          description: `维修方 ${user.username} 已提交维修完成申请，等待管理员审核。`,
+        });
+      } catch (workflowErr: any) {
+        const code = workflowErr?.data?.code;
+        const msg = workflowErr?.message;
+        if (code === 'INVALID_TRANSITION') {
+          alert(msg || '当前状态不允许提交维修完成申请，请先由管理员确认进入维修中。');
+          return;
+        }
+        throw workflowErr;
+      }
+
+      let latestReportId: number | null = null;
+      try {
+        const listData = await repairApi.list(lane.id);
+        if (Array.isArray(listData) && listData.length > 0) {
+          latestReportId = Number(listData[0]?.id) || null;
+        }
+      } catch (err) {
+        console.warn('读取最新维修报告失败，将继续提交完成申请', err);
+      }
+
+      const noticePayload = {
+        event: 'repair_complete_requested',
+        road_id: lane.id,
+        road_name: lane.roadName,
+        maintainer: user.username,
+        latest_report_id: latestReportId,
+        submitted_at: new Date().toISOString(),
+        summary: `维修方 ${user.username} 已提交“维修完成”申请，请管理员审核。`,
+      };
+
+      await messageApi.create({
+        road_id: lane.id,
+        type: 'repair_complete_requested',
+        name: '系统通知',
+        assigned_to: 'admin',
+        text: JSON.stringify(noticePayload),
+      });
+
+      window.dispatchEvent(new CustomEvent('messages-updated'));
+      alert('维修完成申请已提交，等待管理员审核');
+    } catch (err) {
+      console.error('提交维修完成申请失败:', err);
+      alert('提交失败，请稍后重试');
+    } finally {
+      setIsCompletingRepair(false);
     }
   };
 
@@ -363,13 +455,8 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
     let mounted = true;
     const fetchRecord = async () => {
       try {
-        const res = await fetch(`/api/road-condition/${encodeURIComponent(lane.id)}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (mounted) setSavedRecord(data || null);
-        } else {
-          if (mounted) setSavedRecord(null);
-        }
+        const data = await roadApi.get(lane.id);
+        if (mounted) setSavedRecord(data || null);
       } catch (err) {
         if (mounted) setSavedRecord(null);
       }
@@ -451,22 +538,28 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
             </div>
             <div className={`text-2xl font-black ${status.color} flex items-center gap-2`}>{status.text}
               {status.highlight && <span className="px-2 py-0.5 bg-red-500 text-white text-xs rounded-full font-bold animate-pulse shadow-md">需维修</span>}
+              {status.repairing && <span className="px-2 py-0.5 bg-amber-500 text-white text-xs rounded-full font-bold shadow-md">进行中</span>}
             </div>
           </div>
           {/* 破损情况卡片 */}
           <div className="relative overflow-hidden bg-gradient-to-br from-slate-50 to-slate-100 border-2 border-slate-200 p-5 rounded-2xl transition-all duration-300 hover:scale-[1.02] hover:shadow-lg">
-            <div className="absolute -top-4 -right-4 w-20 h-20 bg-white/40 rounded-full blur-xl"></div>
-            <div className="flex items-center gap-2 text-slate-500 text-[10px] font-black uppercase tracking-widest mb-3">
+            <div className="absolute -top-4 -right-4 w-20 h-20 bg-white/40 rounded-full blur-xl pointer-events-none"></div>
+            <div className="relative z-10 flex items-center gap-2 text-slate-500 text-[10px] font-black uppercase tracking-widest mb-3">
               <div className="p-1.5 rounded-lg bg-orange-500">
                 <AlertCircle className="w-3.5 h-3.5 text-white" />
               </div>
               <span>破损情况</span>
               <button
+                type="button"
                 className="ml-auto px-2 py-0.5 text-[10px] bg-gradient-to-r from-amber-400 to-orange-400 text-white rounded-full hover:from-amber-500 hover:to-orange-500 shadow-sm transition-all"
-                onClick={() => setShowDamageDetail(true)}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setShowDamageDetail(true);
+                }}
               >详情</button>
             </div>
-            <div className="text-xl font-black text-slate-800">{savedRecord?.damage_type || '无记录'}</div>
+            <div className="relative z-10 text-xl font-black text-slate-800">{savedRecord?.damage_type || '无记录'}</div>
           </div>
           {/* 通行等级卡片 */}
           <div className="relative overflow-hidden bg-gradient-to-br from-blue-50 to-indigo-50 border-2 border-indigo-100 p-5 rounded-2xl transition-all duration-300 hover:scale-[1.02] hover:shadow-lg">
@@ -515,13 +608,23 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
             )}
             {/* 维修方专属：维修报告按钮 */}
             {user.role === 'maintainer' && (
-              <button
-                className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-amber-500 to-orange-500 text-white rounded-xl font-bold text-sm hover:from-amber-600 hover:to-orange-600 transition-all shadow-md hover:shadow-lg"
-                onClick={() => setShowRepairForm(true)}
-              >
-                <Sparkles className="w-4 h-4" />
-                填写维修报告
-              </button>
+              <>
+                <button
+                  className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-amber-500 to-orange-500 text-white rounded-xl font-bold text-sm hover:from-amber-600 hover:to-orange-600 transition-all shadow-md hover:shadow-lg"
+                  onClick={() => setShowRepairForm(true)}
+                >
+                  <Sparkles className="w-4 h-4" />
+                  填写维修报告
+                </button>
+                <button
+                  className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-500 text-white rounded-xl font-bold text-sm hover:from-emerald-600 hover:to-teal-600 transition-all shadow-md hover:shadow-lg disabled:opacity-60"
+                  onClick={handleCompleteRepair}
+                  disabled={isCompletingRepair}
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  {isCompletingRepair ? '提交中...' : '维修完成'}
+                </button>
+              </>
             )}
             {/* 所有角色均可查看该路段历史维修报告 */}
             <button
@@ -764,7 +867,31 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
                               attachment_urls: repairReport.attachment_urls || [],
                             };
                             try {
-                              const resp = await axios.post('/api/repair-report', payload);
+                              const resp = await repairApi.create(payload);
+                              const reportId = resp?.id || resp?.record?.id || null;
+
+                              try {
+                                await messageApi.create({
+                                  road_id: lane.id,
+                                  type: 'repair_report_submitted',
+                                  name: '系统通知',
+                                  assigned_to: 'admin',
+                                  text: JSON.stringify({
+                                    event: 'repair_report_submitted',
+                                    road_id: lane.id,
+                                    road_name: lane.roadName,
+                                    report_id: reportId,
+                                    report_title: payload.title || '维修报告',
+                                    maintainer: user.username,
+                                    submitted_at: new Date().toISOString(),
+                                    summary: `维修方 ${user.username} 已提交维修报告，请查看并确认道路进入维修中。`,
+                                  }),
+                                });
+                                window.dispatchEvent(new CustomEvent('messages-updated'));
+                              } catch (notifyErr) {
+                                console.warn('维修报告已提交，但管理员通知发送失败', notifyErr);
+                              }
+
                               alert('维修报告已提交');
                               setShowRepairForm(false);
                               setRepairReport({ title: '', start_stake: '', end_stake: '', background: '', detection: '', core_plan: '', materials: '', budget: '', schedule: '', conclusion: '', organization: '', date: '', contact: '', attachment_urls: [], saveError: null });
@@ -862,7 +989,7 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
 
         {/* 报告列表弹窗 */}
         {showReports && ReactDOM.createPortal(
-          <ReportList roadId={lane.id} onClose={() => setShowReports(false)} />,
+          <ReportList roadId={lane.id} initialReportId={reportFocusId || undefined} onClose={() => { setShowReports(false); setReportFocusId(null); }} />,
           document.body
         )}
 
@@ -1057,16 +1184,15 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
                         lat: userReport.lat || null,
                         lng: userReport.lng || null,
                       };
-                      const resp = await axios.post('/api/message', payload);
-                      const messageId = resp?.data?.id || resp?.data?.record?.id || null;
+                      const resp = await messageApi.create(payload);
+                      const messageId = resp?.id || resp?.record?.id || null;
                       window.dispatchEvent(new CustomEvent('damage-reported', { detail: { id: messageId, roadId: lane.id, lat: userReport.lat, lng: userReport.lng, description: userReport.text, severity: userReport.severity || null, photos: userReport.photos || [] } }));
                       alert('上报已发送，管理员会收到通知');
                       setShowUserReport(false);
                       setUserReport({ text: '', photos: [], contact: '', lat: null, lng: null });
                     } catch (err: any) {
                       console.error('send message error', err);
-                      const status = err?.response?.status;
-                      if (status === 413) {
+                      if (err?.status === 413) {
                         alert('上传内容过大，请压缩图片后重试');
                       } else {
                         alert('发送失败，请稍后重试');
@@ -1321,7 +1447,7 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
               {/* 底部操作区 */}
               <div className="px-6 py-4 border-t border-slate-100 bg-white/80 backdrop-blur">
                 <div className="flex gap-3">
-                  {(form.condition === 'Poor' || form.condition === 'Fair') && (
+                  {(form.condition === 'Poor' || form.condition === 'Fair' || form.condition === 'InRepair') && (
                     <button
                       type="button"
                       className="flex-1 py-3 bg-gradient-to-r from-emerald-500 to-green-500 text-white rounded-xl font-bold text-sm hover:from-emerald-600 hover:to-green-600 transition-all shadow-md"
@@ -1360,9 +1486,9 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
                         verified_at: form.verified_at,
                       };
                       try {
-                        const resp = await axios.post('/api/road-condition', payload);
+                        const resp = await roadApi.upsert(payload);
                         setSaveError(null);
-                        const record = resp?.data?.record;
+                        const record = resp?.record;
                         if (record) {
                           if (typeof onSaved === 'function') await onSaved(record);
                         } else {
@@ -1371,9 +1497,9 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
                         alert('保存成功');
                         closeEditForm(record);
                       } catch (e: any) {
-                        console.error('保存接口错误：', e?.response || e);
-                        const status = e?.response?.status;
-                        const serverMsg = e?.response?.data?.message || e?.response?.data || e?.message;
+                        console.error('保存接口错误：', e);
+                        const status = e?.status;
+                        const serverMsg = e?.data?.message || e?.data || e?.message;
                         const friendly = status === 404
                           ? '保存失败：后端接口未找到 (404)。请检查后端路由或 API 路径是否正确。'
                           : `保存失败：${serverMsg || '未知错误'} (status: ${status || 'unknown'})`;
@@ -1626,10 +1752,12 @@ const LaneDetails: React.FC<LaneDetailsProps> = ({ lane, onClose, user, permissi
                           <div className="bg-white/70 backdrop-blur rounded-xl p-3 text-center shadow-sm border border-white/50">
                             <div className={`text-2xl font-black ${
                               spatialResult.laneSummary.condition === 'Poor' ? 'text-red-500' :
+                              spatialResult.laneSummary.condition === 'InRepair' ? 'text-orange-500' :
                               spatialResult.laneSummary.condition === 'Fair' ? 'text-amber-500' :
                               spatialResult.laneSummary.condition === 'Good' ? 'text-green-500' : 'text-slate-400'
                             }`}>
                               {spatialResult.laneSummary.condition === 'Poor' ? '较差' :
+                               spatialResult.laneSummary.condition === 'InRepair' ? '维修中' :
                                spatialResult.laneSummary.condition === 'Fair' ? '一般' :
                                spatialResult.laneSummary.condition === 'Good' ? '良好' :
                                spatialResult.laneSummary.condition === 'Excellent' ? '优良' : '待检'}

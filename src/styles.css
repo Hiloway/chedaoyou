@@ -1,3 +1,2 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* 自定义样式入口
+ * Tailwind 通过 index.html 中的 CDN 引入，此处仅放置项目级自定义样式 */

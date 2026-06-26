@@ -14,8 +14,8 @@ export interface LaneInfo {
   laneCount: number;
   direction: 'north' | 'south' | 'east' | 'west' | 'bidirectional';
   type: LaneType;
-  width: number; // meters
-  condition: 'Excellent' | 'Good' | 'Fair' | 'Poor';
+  width: number | null; // meters（OSM 数据可能缺失，用 null 表示）
+  condition: 'Excellent' | 'Good' | 'Fair' | 'Poor' | 'InRepair' | '未知';
   lastUpdated: string;
   coordinates: { lat: number; lng: number }[];
 }

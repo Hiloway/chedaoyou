@@ -1,9 +1,5 @@
 import React, { useEffect, useState } from 'react';
-
-const getAuthHeader = () => {
-  const token = localStorage.getItem('lane_token');
-  return token ? { Authorization: `Bearer ${token}` } : {};
-};
+import { authApi, accountApi } from '../services/api';
 
 const ProfileModal: React.FC<{ open: boolean; onClose: () => void; onSaved: (acct?: any) => void }> = ({ open, onClose, onSaved }) => {
   const [loading, setLoading] = useState(false);
@@ -18,10 +14,8 @@ const ProfileModal: React.FC<{ open: boolean; onClose: () => void; onSaved: (acc
     if (!open) return;
     setLoading(true);
     setError(null);
-    fetch('/api/me', { headers: { 'Content-Type': 'application/json', ...getAuthHeader() } })
-      .then(async res => {
-        const json = await res.json().catch(() => null);
-        if (!res.ok) throw new Error(json?.message || `${res.status} ${res.statusText}`);
+    authApi.me()
+      .then(json => {
         const acc = json && json.account ? json.account : json;
         setAccount(acc);
         setUsername(acc.username || '');
@@ -40,11 +34,8 @@ const ProfileModal: React.FC<{ open: boolean; onClose: () => void; onSaved: (acc
     setError(null);
     try {
       const body: any = { username, profile };
-      const resp = await fetch(`/api/account/${account.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json', ...getAuthHeader() }, body: JSON.stringify(body) });
-      const data = await resp.json().catch(() => null);
-      if (!resp.ok) throw new Error(data?.message || `${resp.status} ${resp.statusText}`);
+      await accountApi.update(account.id, body);
       setMessage('保存成功');
-      // update local lane_user if username changed
       try {
         const lu = JSON.parse(localStorage.getItem('lane_user') || '{}');
         if (lu && lu.username !== username) {

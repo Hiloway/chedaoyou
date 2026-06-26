@@ -1,5 +1,6 @@
 
 import { LaneInfo, LaneType } from '../types';
+import { mapBoundsToOsm, mapCoordinateToOsm, osmCoordinateToMap } from './coordinateSystem';
 
 const OVERPASS_MIRRORS = [
   'https://overpass-api.de/api/interpreter',
@@ -21,65 +22,99 @@ async function tryFetchWithRetries(url: string, init?: RequestInit, retries = 2,
   throw lastErr;
 }
 
+/**
+ * 将 OSM highway 标签映射为中文道路等级描述
+ */
+const mapRoadType = (highway?: string): string => {
+  switch (highway) {
+    case 'motorway': return '高速公路';
+    case 'trunk': return '城市快速路';
+    case 'primary': return '一级主干道';
+    case 'secondary': return '二级干道';
+    case 'tertiary': return '三级干道';
+    default: return '常规车道';
+  }
+};
+
+/**
+ * 基于 OSM id 的确定性 hash（0~1），保证同一条路在 fetchRealLanes
+ * 与 fetchRealLanesByBbox 两个入口下得到完全一致的随机路况
+ */
+const hashIdToRand = (id: number | string): number => {
+  const idStr = String(id);
+  let hash = 0;
+  for (let i = 0; i < idStr.length; i++) {
+    hash = (hash << 5) - hash + idStr.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash) % 100 / 100;
+};
+
+/**
+ * 根据 OSM smoothness 标签推断路况；缺失时用确定性 hash 兜底
+ */
+const deriveCondition = (tags: any, id: number | string): LaneInfo['condition'] => {
+  const smoothness = tags?.smoothness;
+  if (smoothness === 'excellent') return 'Excellent';
+  if (['good', 'intermediate'].includes(smoothness)) return 'Good';
+  if (['bad', 'very_bad'].includes(smoothness)) return 'Fair';
+  if (['horrible', 'very_horrible', 'impassable'].includes(smoothness)) return 'Poor';
+
+  const rand = hashIdToRand(id);
+  if (rand > 0.9) return 'Poor';
+  if (rand > 0.7) return 'Fair';
+  if (rand > 0.4) return 'Excellent';
+  return 'Good';
+};
+
+/**
+ * 将单个 OSM element 映射为 LaneInfo（两个 fetch 入口共用，避免逻辑重复）
+ */
+const mapOsmElementToLane = (el: any): LaneInfo | null => {
+  const tags = el.tags || {};
+  const roadTypeDesc = mapRoadType(tags.highway);
+  const coordinates = el.geometry
+    ? el.geometry.map((pt: any) => osmCoordinateToMap(pt.lat, pt.lon)).filter(Boolean)
+    : [];
+  if (coordinates.length === 0) return null;
+
+  return {
+    id: `osm-${el.id}`,
+    roadName: tags.name || tags.ref || roadTypeDesc,
+    laneCount: parseInt(tags.lanes) || (tags.oneway === 'yes' ? 3 : 6),
+    direction: tags.oneway === 'yes' ? 'north' : 'bidirectional',
+    type: LaneType.CAR,
+    width: tags.width ? parseFloat(tags.width) : null,
+    condition: deriveCondition(tags, el.id),
+    lastUpdated: new Date().toISOString().split('T')[0],
+    coordinates,
+  };
+};
+
+const parseOverpassResponse = (data: any): LaneInfo[] => {
+  if (!data || !data.elements) return [];
+  return data.elements
+    .map(mapOsmElementToLane)
+    .filter((lane: LaneInfo | null): lane is LaneInfo => lane !== null);
+};
+
 export const fetchRealLanes = async (lat: number, lng: number, radius: number = 800): Promise<LaneInfo[]> => {
+  const centerForQuery = mapCoordinateToOsm(lat, lng);
   const query = `
     [out:json][timeout:30];
-    way(around:${radius}, ${lat}, ${lng})["highway"~"^(motorway|trunk|primary|secondary|tertiary)$"];
+    way(around:${radius}, ${centerForQuery.lat}, ${centerForQuery.lng})["highway"~"^(motorway|trunk|primary|secondary|tertiary)$"];
     out geom;
   `;
-  
+
   for (const baseUrl of OVERPASS_MIRRORS) {
     const url = `${baseUrl}?data=${encodeURIComponent(query)}`;
-    
     try {
       const response = await tryFetchWithRetries(url, undefined, 2, 500);
       if (!response.ok) continue;
       const contentType = response.headers.get('content-type');
       if (!contentType || !contentType.includes('application/json')) continue;
-
       const data = await response.json();
-      if (!data || !data.elements) return [];
-
-      return data.elements.map((el: any) => {
-        const tags = el.tags || {};
-        
-        // 映射道路等级
-        let roadTypeDesc = '常规车道';
-        if (tags.highway === 'motorway') roadTypeDesc = '高速公路';
-        else if (tags.highway === 'trunk') roadTypeDesc = '城市快速路';
-        else if (tags.highway === 'primary') roadTypeDesc = '一级主干道';
-        else if (tags.highway === 'secondary') roadTypeDesc = '二级干道';
-        else if (tags.highway === 'tertiary') roadTypeDesc = '三级干道';
-
-      
-        let condition: 'Excellent' | 'Good' | 'Fair' | 'Poor' | '未知' = '未知';
-        const smoothness = tags.smoothness;
-        if (smoothness === 'excellent') condition = 'Excellent';
-        else if (['good', 'intermediate'].includes(smoothness)) condition = 'Good';
-        else if (['bad', 'very_bad'].includes(smoothness)) condition = 'Fair';
-        else if (['horrible', 'very_horrible', 'impassable'].includes(smoothness)) condition = 'Poor';
-        else {
-         
-          const rand = (el.id % 100) / 100;
-          if (rand > 0.9) condition = 'Poor';
-          else if (rand > 0.7) condition = 'Fair';
-          else if (rand > 0.4) condition = 'Excellent';
-          else condition = 'Good';
-        }
-
-        return {
-          id: `osm-${el.id}`,
-          roadName: tags.name || tags.ref || `${roadTypeDesc}`,
-          laneCount: parseInt(tags.lanes) || (tags.oneway === 'yes' ? 3 : 6),
-          direction: tags.oneway === 'yes' ? 'north' : 'bidirectional',
-          type: LaneType.CAR,
-          width: tags.width ? parseFloat(tags.width) : null,
-          condition: condition,
-          lastUpdated: new Date().toISOString().split('T')[0],
-          coordinates: el.geometry ? el.geometry.map((pt: any) => ({ lat: pt.lat, lng: pt.lon })) : []
-        };
-      }).filter((lane: any) => lane.coordinates.length > 0);
-
+      return parseOverpassResponse(data);
     } catch (error) {
       console.error(`镜像 ${baseUrl} 失败:`, error);
     }
@@ -98,73 +133,29 @@ export const fetchRealLanesByBbox = async (
   north: number,
   east: number,
   signal?: AbortSignal,
-  maxAreaDeg?: number // 可选面积上限（经纬度度数），避免范围过大
+  maxAreaDeg?: number
 ): Promise<LaneInfo[]> => {
-  // 简单保护：如果 bbox 面积过大，直接返回空数组（避免请求 Overpass 超时）
-  const areaDeg = Math.abs(north - south) * Math.abs(east - west);
+  const osmBbox = mapBoundsToOsm(south, west, north, east);
+  // 简单保护：bbox 面积过大直接返回空数组，避免 Overpass 超时
+  const areaDeg = Math.abs(osmBbox.north - osmBbox.south) * Math.abs(osmBbox.east - osmBbox.west);
   if (maxAreaDeg && areaDeg > maxAreaDeg) return [];
-  if (areaDeg > 1.0) return []; // 非常粗糙的阈值（约 1 度 * 1 度）
+  if (areaDeg > 1.0) return [];
 
   const query = `
     [out:json][timeout:30];
-    way(${south},${west},${north},${east})["highway"~"^(motorway|trunk|primary|secondary|tertiary)$"];
+    way(${osmBbox.south},${osmBbox.west},${osmBbox.north},${osmBbox.east})["highway"~"^(motorway|trunk|primary|secondary|tertiary)$"];
     out geom;
   `;
 
   for (const baseUrl of OVERPASS_MIRRORS) {
     const url = `${baseUrl}?data=${encodeURIComponent(query)}`;
-
     try {
       const response = await tryFetchWithRetries(url, { signal }, 2, 500);
       if (!response.ok) continue;
       const contentType = response.headers.get('content-type');
       if (!contentType || !contentType.includes('application/json')) continue;
-
       const data = await response.json();
-      if (!data || !data.elements) return [];
-
-      return data.elements.map((el: any) => {
-        const tags = el.tags || {};
-        let roadTypeDesc = '常规车道';
-        if (tags.highway === 'motorway') roadTypeDesc = '高速公路';
-        else if (tags.highway === 'trunk') roadTypeDesc = '城市快速路';
-        else if (tags.highway === 'primary') roadTypeDesc = '一级主干道';
-        else if (tags.highway === 'secondary') roadTypeDesc = '二级干道';
-        else if (tags.highway === 'tertiary') roadTypeDesc = '三级干道';
-
-        let condition: 'Excellent' | 'Good' | 'Fair' | 'Poor' | '未知' = '未知';
-        const smoothness = tags.smoothness;
-        if (smoothness === 'excellent') condition = 'Excellent';
-        else if (['good', 'intermediate'].includes(smoothness)) condition = 'Good';
-        else if (['bad', 'very_bad'].includes(smoothness)) condition = 'Fair';
-        else if (['horrible', 'very_horrible', 'impassable'].includes(smoothness)) condition = 'Poor';
-        else {
-          const idStr = String(el.id);
-          let hash = 0;
-          for (let i = 0; i < idStr.length; i++) {
-            hash = (hash << 5) - hash + idStr.charCodeAt(i);
-            hash |= 0;
-          }
-          const rand = Math.abs(hash) % 100 / 100;
-          if (rand > 0.9) condition = 'Poor';
-          else if (rand > 0.7) condition = 'Fair';
-          else if (rand > 0.4) condition = 'Excellent';
-          else condition = 'Good';
-        }
-
-        return {
-          id: `osm-${el.id}`,
-          roadName: tags.name || tags.ref || `${roadTypeDesc}`,
-          laneCount: parseInt(tags.lanes) || (tags.oneway === 'yes' ? 3 : 6),
-          direction: tags.oneway === 'yes' ? 'north' : 'bidirectional',
-          type: LaneType.CAR,
-          width: tags.width ? parseFloat(tags.width) : null,
-          condition: condition,
-          lastUpdated: new Date().toISOString().split('T')[0],
-          coordinates: el.geometry ? el.geometry.map((pt: any) => ({ lat: pt.lat, lng: pt.lon })) : []
-        };
-      }).filter((lane: any) => lane.coordinates.length > 0);
-
+      return parseOverpassResponse(data);
     } catch (error) {
       if (error && (error as any).name === 'AbortError') throw error;
       console.error(`bbox 镜像 ${baseUrl} 失败:`, error);
